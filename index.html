@@ -43,7 +43,7 @@ main{max-width:1240px;margin:auto;padding:22px max(4vw,16px) 60px}
 .dh{padding:10px 12px;border-bottom:2px solid var(--gold);display:flex;justify-content:space-between;align-items:center;gap:8px}
 .dh b{font-size:16px}.dh .jawi{font-size:17px;color:var(--mute)}
 .dh.today{background:var(--soft)}
-.dday{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--soft)}.dday button{width:100%;font-size:14px;font-weight:600;color:var(--green)}
+.dday{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--soft)}.dday{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.dday span{flex:1;font-size:14px;font-weight:600;color:var(--green);white-space:nowrap}.dday button{font-size:14px;font-weight:600;color:var(--green);min-height:40px;padding:6px 10px}
 .slot{padding:12px;border-bottom:1px solid var(--line);display:grid;gap:6px}
 .slot:last-child{border-bottom:0}
 .time{font-size:20px;font-weight:800;color:var(--green);white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -154,10 +154,7 @@ label.f{display:grid;gap:4px;font-size:14px;color:var(--mute)}
       entries.splice(ci + 1, 0, await textEntry('word/document.xml', body));
       return zip(entries);
     }
-    // Many RPH in one .docx: each lesson becomes its own section (new page), header per tingkatan.
-    async function docxMany(items) { // items: [{id, v, orig}]
-      const sh = await getShared();
-      const fill = async it => {
+    const fill = async it => {
         const xml = await getDoc(it.id), v = it.v;
         const [y, m, d] = v.iso.split('-').map(Number), wd = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
         const vals = {
@@ -167,6 +164,9 @@ label.f{display:grid;gap:4px;font-size:14px;color:var(--mute)}
         };
         return { ting: vals.TING, xml: xml.replace(/\{\{([A-Z_]+)\}\}/g, (a, k) => k in vals ? esc(vals[k]) : a) };
       };
+    // Many RPH in one .docx: each lesson becomes its own section (new page), header per tingkatan.
+    async function docxMany(items) { // items: [{id, v, orig}]
+      const sh = await getShared();
       const docs = []; for (const it of items) docs.push(await fill(it));
       const tings = [...new Set(docs.map(x => x.ting))], rid = t => t === tings[0] ? 'rId9' : 'rIdT' + t.replace(/\W/g, '');
       let sid = 1, head = '', body = '', lastSect = '';
@@ -210,10 +210,248 @@ label.f{display:grid;gap:4px;font-size:14px;color:var(--mute)}
       for (const f of files) { const u = new Uint8Array(await f.blob.arrayBuffer()); es.push({ name: f.name, crc: crc32(u), size: u.length, data: u, method: 0 }); }
       return zip(es);
     }
-    return { docx, docxMany, bundle, getDoc };
+    async function part(name) { const sh = await getShared(); const p = sh.parts.find(x => x.n === name); return p && (p.tpl ? enc.encode(p.tpl) : inflate(b64(p.c))); }
+    let imgsP = null;
+    function headerImgs() {
+      if (!imgsP) imgsP = (async () => {
+        const rels = dec.decode(await part('word/_rels/header2.xml.rels')), tgt = id => (rels.match(new RegExp('Id="' + id + '"[^>]*Target="([^"]+)"')) || rels.match(new RegExp('Target="([^"]+)"[^>]*Id="' + id + '"')) || [])[1];
+        const load = async id => { const t = tgt(id); if (!t) return null; const b = await part('word/' + t); return b ? createImageBitmap(new Blob([b])) : null; };
+        return { kpm: await load('rId1'), logo: await load('rId2'), title: await load('rId3') };
+      })();
+      return imgsP;
+    }
+    async function pdfMany(items, onProgress) {
+      await root.RPHPdf.ensureFonts(); const imgs = await headerImgs(), pages = [];
+      for (const [i, it] of items.entries()) {
+        if (onProgress) onProgress(i, items.length);
+        const f = await fill(it);
+        pages.push(...root.RPHPdf.render(f.xml, { imgs, headerText: (it.v.sekolah || '') + ' – RPH Tingkatan ' + f.ting }));
+        await new Promise(r => setTimeout(r, 0));
+      }
+      return root.RPHPdf.pdfFromCanvases(pages);
+    }
+    return { docx, docxMany, pdfMany, bundle, getDoc };
   }
   const api = { makeGenerator, crc32, HARI };
   if (typeof module !== 'undefined') module.exports = api; else root.RPHCore = api;
+})(this);
+</script>
+<script>/* RPH → PDF in the browser: lays out the filled RPH table on canvas pages (Jawi shaped by the browser) and writes an image PDF. */
+(function (root) {
+  const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const PX = 0.1;                         // px per twip (144 dpi)
+  const PW = 1224, PH = 1584;             // US Letter at 144 dpi
+  const TOP = 1337 * PX, BOTTOM = PH - 709 * PX;
+  const FAM = '"Noto Naskh Arabic","Arabic Typesetting","Traditional Arabic","Geeza Pro","Segoe UI","Tahoma",serif';
+  const SCALE = 0.72;                     // Arabic Typesetting pt → Naskh px at 144 dpi
+  const PAD = 7, LH = 1.5;
+  const ARAB = /[؀-ۿݐ-ݿ]/;
+
+  const el = (n, name) => n && Array.from(n.children).filter(c => c.namespaceURI === W && c.localName === name);
+  const one = (n, name) => (el(n, name) || [])[0];
+  const val = (n, a = 'val') => n ? n.getAttributeNS(W, a) : null;
+
+  function cellsOf(tr) {
+    const out = [];
+    for (const c of tr.children) {
+      if (c.localName === 'tc') out.push(c);
+      else if (c.localName === 'sdt') { const sc = one(c, 'sdtContent'); if (sc) out.push(...el(sc, 'tc')); }
+      else if (c.localName === 'customXml') out.push(...el(c, 'tc'));
+    }
+    return out;
+  }
+  function blocksOf(n, out = []) {
+    for (const c of n.children) {
+      if (c.namespaceURI !== W) continue;
+      if (c.localName === 'p') out.push({ type: 'p', node: c });
+      else if (c.localName === 'tbl') out.push({ type: 'tbl', node: c });
+      else if (c.localName === 'sdt') { const sc = one(c, 'sdtContent'); if (sc) blocksOf(sc, out); }
+    }
+    return out;
+  }
+  function para(p) {
+    const pPr = one(p, 'pPr'), mark = pPr && one(pPr, 'rPr');
+    let text = '', sizes = {}, boldN = 0, allN = 0;
+    const defSz = +(val(mark && one(mark, 'sz')) || 28);
+    for (const r of p.getElementsByTagNameNS(W, 'r')) {
+      if (r.parentNode && r.parentNode.localName === 'pPr') continue;
+      const rPr = one(r, 'rPr'), sz = +(val(rPr && one(rPr, 'szCs')) || val(rPr && one(rPr, 'sz')) || defSz);
+      const b = rPr && (one(rPr, 'b') || one(rPr, 'bCs')); const bold = b && val(b) !== '0' && val(b) !== 'false';
+      let t = '';
+      for (const c of r.children) {
+        if (c.localName === 't') t += c.textContent;
+        else if (c.localName === 'br' || c.localName === 'cr') t += '\n';
+        else if (c.localName === 'tab') t += '  ';
+        else if (c.localName === 'sym') t += '☐';
+      }
+      if (!t) continue;
+      text += t; const n = t.replace(/\s/g, '').length || 1;
+      sizes[sz] = (sizes[sz] || 0) + n; allN += n; if (bold) boldN += n;
+    }
+    const sz = +(Object.entries(sizes).sort((a, b) => b[1] - a[1])[0] || [defSz])[0];
+    const bidi = !!(pPr && one(pPr, 'bidi'));
+    let jc = val(pPr && one(pPr, 'jc')) || '';
+    if (jc === 'both' || jc === 'distribute' || !jc) jc = bidi ? 'right' : (ARAB.test(text) ? 'right' : 'left');
+    else if (jc === 'start') jc = bidi ? 'right' : 'left'; else if (jc === 'end') jc = bidi ? 'left' : 'right';
+    return { text: text.replace(/[‎‏]/g, m => m), sz, bold: boldN > allN / 2, align: jc, rtl: bidi || ARAB.test(text) };
+  }
+  const font = (pp) => (pp.bold ? '600 ' : '') + (pp.sz * SCALE).toFixed(1) + 'px ' + FAM;
+
+  function wrap(ctx, pp, width) {
+    ctx.font = font(pp); ctx.direction = pp.rtl ? 'rtl' : 'ltr';
+    const lines = [];
+    for (const hard of pp.text.split('\n')) {
+      const words = hard.split(/(\s+)/); let cur = '';
+      for (const w of words) {
+        const tryL = cur + w;
+        if (ctx.measureText(tryL.trim()).width <= width || !cur.trim()) {
+          if (!cur.trim() && ctx.measureText(w.trim()).width > width) { // very long word: break by characters
+            let chunk = ''; for (const ch of w) { if (ctx.measureText(chunk + ch).width > width && chunk) { lines.push(chunk); chunk = ''; } chunk += ch; } cur = chunk;
+          } else cur = tryL;
+        } else { lines.push(cur.trim()); cur = w.trimStart(); }
+      }
+      lines.push(cur.trim());
+    }
+    return lines;
+  }
+
+  // Layout a table into rows of positioned cells (relative coordinates), returns {w, rows:[{h, cells}], merges}
+  function layoutTable(ctx, tbl, maxW) {
+    const tblPr = one(tbl, 'tblPr'), rtl = !!(tblPr && one(tblPr, 'bidiVisual'));
+    let grid = el(one(tbl, 'tblGrid'), 'gridCol').map(g => +val(g, 'w') * PX);
+    let tw = grid.reduce((a, b) => a + b, 0);
+    if (tw > maxW) { grid = grid.map(g => g * maxW / tw); tw = maxW; }
+    const xs = [0]; for (const g of grid) xs.push(xs[xs.length - 1] + g);
+    const rows = [], active = {};
+    for (const tr of el(tbl, 'tr')) {
+      const trPr = one(tr, 'trPr'), th = trPr && one(trPr, 'trHeight');
+      const row = { min: th ? +val(th) * PX : 0, h: 0, cells: [] }; rows.push(row);
+      let col = 0;
+      for (const tc of cellsOf(tr)) {
+        const pr = one(tc, 'tcPr'), span = +(val(pr && one(pr, 'gridSpan')) || 1), vm = pr && one(pr, 'vMerge');
+        const x = xs[col], w = xs[Math.min(col + span, grid.length)] - x;
+        const vx = rtl ? tw - x - w : x;
+        if (vm && val(vm) !== 'restart') { const m = active[col]; if (m) m.rowspan++; col += span; continue; }
+        const borders = {}, bd = pr && one(pr, 'tcBorders');
+        for (const side of ['top', 'left', 'bottom', 'right', 'start', 'end']) { const b = bd && one(bd, side); if (b) borders[side === 'start' ? 'left' : side === 'end' ? 'right' : side] = { v: val(b), c: val(b, 'color') }; }
+        const shd = pr && one(pr, 'shd'), fill = shd && val(shd, 'fill');
+        const cell = { x: vx, w, rowspan: 1, borders, fill: fill && fill !== 'auto' ? '#' + fill : null, vAlign: val(pr && one(pr, 'vAlign')) || 'top', blocks: [] };
+        let ch = 0;
+        for (const b of blocksOf(tc)) {
+          if (b.type === 'p') { const pp = para(b.node); const lh = pp.sz * SCALE * LH; const lines = wrap(ctx, pp, w - 2 * PAD); const hgt = lines.length * lh; cell.blocks.push({ type: 'p', pp, lines, lh, y: ch, h: hgt }); ch += hgt; }
+          else { const t = layoutTable(ctx, b.node, w - 2 * PAD); const tx = rtl ? (w - 2 * PAD - t.w) / 2 : (w - 2 * PAD - t.w) / 2; cell.blocks.push({ type: 'tbl', t, y: ch, x: tx, h: t.h }); ch += t.h; }
+        }
+        cell.ch = ch + 6;
+        if (vm) active[col] = cell; else delete active[col];
+        row.cells.push(cell); cell.row = rows.length - 1;
+        col += span;
+      }
+    }
+    for (const r of rows) r.h = Math.max(r.min, ...r.cells.filter(c => c.rowspan === 1).map(c => c.ch), 1);
+    for (let i = 0; i < rows.length; i++) for (const c of rows[i].cells) if (c.rowspan > 1) {
+      const sum = rows.slice(i, i + c.rowspan).reduce((a, r) => a + r.h, 0);
+      if (sum < c.ch) rows[i + c.rowspan - 1].h += c.ch - sum;
+    }
+    let y = 0; for (const r of rows) { r.y = y; y += r.h; }
+    for (let i = 0; i < rows.length; i++) for (const c of rows[i].cells) c.h = rows.slice(i, i + c.rowspan).reduce((a, r) => a + r.h, 0);
+    return { w: tw, h: y, rows };
+  }
+
+  function line(ctx, x1, y1, x2, y2, b) {
+    if (b && (b.v === 'nil' || b.v === 'none')) return;
+    const v = b ? b.v : 'single';
+    ctx.save(); ctx.strokeStyle = b && b.c && b.c !== 'auto' ? '#' + b.c : '#000';
+    if (v === 'dotted' || v === 'dashed') { ctx.setLineDash([2, 3]); ctx.lineWidth = 1.2; }
+    else ctx.lineWidth = v === 'double' || v === 'thick' ? 2.2 : 1.2;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); ctx.restore();
+  }
+  function drawTable(ctx, t, ox, oy, rowFrom = 0, rowTo = t.rows.length) {
+    const base = t.rows[rowFrom].y;
+    for (let i = rowFrom; i < rowTo; i++) for (const c of t.rows[i].cells) {
+      const x = ox + c.x, y = oy + t.rows[i].y - base, h = c.h;
+      if (c.fill) { ctx.fillStyle = c.fill; ctx.fillRect(x, y, c.w, h); }
+      const off = c.vAlign === 'center' ? Math.max(0, (h - c.ch) / 2) : c.vAlign === 'bottom' ? Math.max(0, h - c.ch) : 0;
+      for (const b of c.blocks) {
+        const by = y + 3 + off + b.y;
+        if (b.type === 'tbl') { drawTable(ctx, b.t, x + PAD + b.x, by); continue; }
+        const pp = b.pp; ctx.font = font(pp); ctx.fillStyle = '#000'; ctx.direction = pp.rtl ? 'rtl' : 'ltr'; ctx.textBaseline = 'middle';
+        b.lines.forEach((ln, k) => {
+          const ly = by + k * b.lh + b.lh / 2;
+          if (pp.align === 'center') { ctx.textAlign = 'center'; ctx.fillText(ln, x + c.w / 2, ly); }
+          else if (pp.align === 'left') { ctx.textAlign = 'left'; ctx.fillText(ln, x + PAD, ly); }
+          else { ctx.textAlign = 'right'; ctx.fillText(ln, x + c.w - PAD, ly); }
+        });
+      }
+      const B = c.borders;
+      line(ctx, x, y, x + c.w, y, B.top); line(ctx, x, y + h, x + c.w, y + h, B.bottom);
+      line(ctx, x, y, x, y + h, B.left); line(ctx, x + c.w, y, x + c.w, y + h, B.right);
+    }
+  }
+
+  function drawHeader(ctx, imgs, text) {
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, PW, PH);
+    const E = 144 / 914400, mx = 72, py = 72;
+    if (imgs.kpm) ctx.drawImage(imgs.kpm, mx - 82550 * E, py - 325120 * E, 650240 * E, 650240 * E);
+    if (imgs.logo) ctx.drawImage(imgs.logo, mx + 6307455 * E, py - 311785 * E, 624205 * E, 610235 * E);
+    if (imgs.title) ctx.drawImage(imgs.title, mx + 2065655 * E, py - 325755 * E, 3040380 * E, 465455 * E);
+    ctx.font = 'italic 19px Calibri,"Segoe UI",Arial,sans-serif'; ctx.fillStyle = '#333'; ctx.textAlign = 'center'; ctx.direction = 'ltr'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(text, PW / 2 + 14, py + 46);
+  }
+
+  // xml: filled document.xml string → array of canvases
+  function render(xml, o) {
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    const body = doc.getElementsByTagNameNS(W, 'body')[0], tbl = el(body, 'tbl')[0];
+    const mk = () => { const c = document.createElement('canvas'); c.width = PW; c.height = PH; const ctx = c.getContext('2d'); drawHeader(ctx, o.imgs, o.headerText); return c; };
+    const probe = document.createElement('canvas').getContext('2d');
+    const t = layoutTable(probe, tbl, PW - 2 * 40);
+    const ox = (PW - t.w) / 2;
+    // groups of rows that must stay together (rowspans)
+    const groups = []; let gs = 0, reach = 0;
+    t.rows.forEach((r, i) => { for (const c of r.cells) reach = Math.max(reach, i + c.rowspan - 1); if (reach === i) { groups.push([gs, i + 1]); gs = i + 1; } });
+    const pages = []; let cur = null, from = 0, used = 0;
+    const flush = to => { if (cur && to > from) drawTable(cur.getContext('2d'), t, ox, TOP, from, to); };
+    for (const [a, b] of groups) {
+      const gh = t.rows[b - 1].y + t.rows[b - 1].h - t.rows[a].y;
+      if (!cur) { cur = mk(); pages.push(cur); from = a; used = 0; }
+      else if (used + gh > BOTTOM - TOP && used > 0) { flush(a); cur = mk(); pages.push(cur); from = a; used = 0; }
+      used += gh;
+    }
+    flush(t.rows.length);
+    return pages;
+  }
+
+  // ---- minimal image PDF ----
+  async function pdfFromCanvases(canvases) {
+    const enc = new TextEncoder(), parts = [], offs = []; let len = 0;
+    const push = d => { const u = typeof d === 'string' ? enc.encode(d) : d; parts.push(u); len += u.length; };
+    const obj = (n, body) => { offs[n] = len; push(n + ' 0 obj\n'); for (const b of [].concat(body)) push(b); push('\nendobj\n'); };
+    push('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+    const n = canvases.length, kids = [];
+    for (let i = 0; i < n; i++) kids.push((3 + i * 3) + ' 0 R');
+    obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
+    obj(2, '<< /Type /Pages /Kids [' + kids.join(' ') + '] /Count ' + n + ' >>');
+    for (let i = 0; i < n; i++) {
+      const blob = await new Promise(r => canvases[i].toBlob(r, 'image/jpeg', 0.9));
+      const jpg = new Uint8Array(await blob.arrayBuffer()), p = 3 + i * 3;
+      const cs = 'q 612 0 0 792 0 0 cm /Im0 Do Q';
+      obj(p, '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im0 ' + (p + 2) + ' 0 R >> >> /Contents ' + (p + 1) + ' 0 R >>');
+      obj(p + 1, ['<< /Length ' + cs.length + ' >>\nstream\n', cs, '\nendstream']);
+      obj(p + 2, ['<< /Type /XObject /Subtype /Image /Width ' + canvases[i].width + ' /Height ' + canvases[i].height + ' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ' + jpg.length + ' >>\nstream\n', jpg, '\nendstream']);
+    }
+    const total = 3 + n * 3, xref = len;
+    let x = 'xref\n0 ' + total + '\n0000000000 65535 f \n';
+    for (let i = 1; i < total; i++) x += String(offs[i]).padStart(10, '0') + ' 00000 n \n';
+    push(x + 'trailer\n<< /Size ' + total + ' /Root 1 0 R >>\nstartxref\n' + xref + '\n%%EOF\n');
+    return new Blob(parts, { type: 'application/pdf' });
+  }
+
+  async function ensureFonts() {
+    if (!document.fonts || !document.fonts.load) return;
+    try { await Promise.race([Promise.all([document.fonts.load('22px "Noto Naskh Arabic"', 'ڤڠ'), document.fonts.load('600 22px "Noto Naskh Arabic"', 'ڤڠ')]), new Promise(r => setTimeout(r, 4000))]); } catch (e) {}
+  }
+
+  root.RPHPdf = { render, pdfFromCanvases, ensureFonts };
 })(this);
 </script>
 </head>
@@ -227,7 +465,7 @@ label.f{display:grid;gap:4px;font-size:14px;color:var(--mute)}
 </header>
 <main>
   <section id="v-minggu">
-    <div class="bar"><div class="grow note" id="sync">Memuatkan…</div><button class="pri" id="dlWeek">Muat turun semua RPH minggu ini (.zip)</button></div>
+    <div class="bar"><div class="grow note" id="sync">Memuatkan…</div><span class="note">Semua RPH minggu ini:</span><button class="pri" id="dlWeek">Word (.zip)</button><button class="pri" id="dlWeekPdf">PDF</button></div>
     <div class="status" id="st" role="status"></div>
     <div class="chips" id="wnota" style="margin-bottom:12px"></div>
     <div class="week" id="week"></div>
@@ -333,19 +571,21 @@ function renderWeek(){
     if(d<S.mula)return `<div class="day">${head}<div class="hol">Sebelum sesi bermula</div></div>`;
     if(c)return `<div class="day">${head}<div class="hol">${esc(c.nama||'Cuti')}</div></div>`;
     const my=L.filter(l=>l.d===d), nOk=my.filter(l=>l.tid&&!l.cancel).length;
-    return `<div class="day">${head}${nOk?`<div class="dday"><button data-day="${d}">RPH harian (${nOk}) · .docx</button></div>`:''}${my.length?my.map(l=>{const t=l.tid&&byId[l.tid];
+    return `<div class="day">${head}${nOk?`<div class="dday"><span>RPH harian (${nOk})</span><button data-day="${d}">.docx</button><button data-dayp="${d}">.pdf</button></div>`:''}${my.length?my.map(l=>{const t=l.tid&&byId[l.tid];
       return `<div class="slot${l.cancel?' cancel':''}" data-k="${d}|${l.s.id}"><div class="time">${esc(l.s.mula)}–${esc(l.s.tamat)}</div>
       <div class="cls">${esc(l.s.kelas)} <span class="note">· PI T${esc(l.s.ting)}</span></div>
       <select aria-label="Tajuk untuk ${esc(l.s.kelas)}"><option value="cancel">— Tiada kelas / batal —</option>${l.tid?'':'<option value="" selected>— Semua tajuk sudah diajar · pilih —</option>'}${opts(l.s.subj)}</select>
       ${t?`<div class="jawi">${esc(t.topik)}</div>`:''}
-      <div class="acts">${t?`<span class="tag">${esc(t.bidang)}</span>`:''}${l.ovr||l.cancel?'<span class="tag o">diubah</span><button data-a="reset">Ikut turutan</button>':''}${t&&!l.cancel?'<button data-a="dl" class="pri">.docx</button>':''}</div></div>`}).join(''):'<div class="empty">Tiada waktu mengajar.</div>'}</div>`}).join('')||'<div class="empty">Tiada hari persekolahan dipilih.</div>';
+      <div class="acts">${t?`<span class="tag">${esc(t.bidang)}</span>`:''}${l.ovr||l.cancel?'<span class="tag o">diubah</span><button data-a="reset">Ikut turutan</button>':''}${t&&!l.cancel?'<button data-a="dl" class="pri">.docx</button><button data-a="pdf">.pdf</button>':''}</div></div>`}).join(''):'<div class="empty">Tiada waktu mengajar.</div>'}</div>`}).join('')||'<div class="empty">Tiada hari persekolahan dipilih.</div>';
   for(const el of document.querySelectorAll('.slot')){const k=el.dataset.k,l=L.find(x=>x.d+'|'+x.s.id===k),sel=el.querySelector('select');
     sel.value=l.cancel?'cancel':(l.tid||'');
     sel.onchange=()=>{if(sel.value)S.ovr[k]=sel.value;else delete S.ovr[k];save();renderWeek()};
     el.querySelector('[data-a=reset]')?.addEventListener('click',()=>{delete S.ovr[k];save();renderWeek()});
-    el.querySelector('[data-a=dl]')?.addEventListener('click',()=>downloadOne(l,m));}
+    el.querySelector('[data-a=dl]')?.addEventListener('click',()=>downloadOne(l,m));
+    el.querySelector('[data-a=pdf]')?.addEventListener('click',()=>downloadPdf([l],m,fname(l,m).replace(/\.docx$/,'.pdf')));}
+  for(const b of document.querySelectorAll('[data-dayp]'))b.onclick=()=>{const d=b.dataset.dayp;downloadPdf(L.filter(l=>l.d===d&&l.tid&&!l.cancel),m,clean(`RPH Harian M${m??''} ${d} ${HM[new Date(P(d)).getUTCDay()]}`)+'.pdf')};
   for(const b of document.querySelectorAll('[data-day]'))b.onclick=()=>downloadDay(b.dataset.day,L.filter(l=>l.d===b.dataset.day&&l.tid&&!l.cancel),m);
-  $('#dlWeek').disabled=!L.some(l=>l.tid&&!l.cancel);
+  $('#dlWeek').disabled=$('#dlWeekPdf').disabled=!L.some(l=>l.tid&&!l.cancel);
 }
 const clean=s=>s.replace(/[\\/:*?"<>|]+/g,' ').replace(/\s+/g,' ').trim();
 const fname=(l,m)=>clean(`RPH M${m??''} ${l.d} ${l.s.kelas} ${byId[l.tid].label}`)+'.docx';
@@ -357,6 +597,12 @@ async function give(name,blob){
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.append(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},4000);return true;
 }
 async function downloadOne(l,m){try{status('Menjana '+byId[l.tid].label+'…');const b=await build(l,m);status((await give(fname(l,m),b))?'Siap: '+fname(l,m):'Muat turun dibatalkan.')}catch(e){status('Gagal: '+(e.message||e.code||e),true)}}
+const itemOf=(l,m)=>({id:l.tid,orig:byId[l.tid].orig,v:{minggu:m,iso:l.d,masa:l.s.mula.replace(/^0/,'')+'-'+l.s.tamat.replace(/^0/,''),ting:l.s.ting,kelas:l.s.kelas,bil:l.s.bil,tempat:l.s.tempat,sekolah:S.sekolah}});
+let busy=false;
+async function downloadPdf(ls,m,name){if(busy)return;busy=true;try{status('Menyediakan PDF…');
+  const b=await gen.pdfMany(ls.map(l=>itemOf(l,m)),(i,n)=>status(`Menyediakan PDF ${i+1}/${n}…`));
+  status((await give(name,b))?`Siap: ${name}`+(ls.length>1?` (${ls.length} RPH)`:''):'Muat turun dibatalkan.')}catch(e){status('Gagal: '+(e.message||e.code||e),true)}busy=false}
+$('#dlWeekPdf').onclick=()=>{const ws=wkStart,m=minggu(ws);downloadPdf(lessonsOf(ws).filter(l=>l.tid&&!l.cancel),m,clean(`RPH Minggu ${m??''} ${days(ws)[0]}`)+'.pdf')};
 async function downloadDay(d,ls,m){try{status('Menjana RPH harian ('+ls.length+' kelas)…');
   const items=ls.map(l=>({id:l.tid,orig:byId[l.tid].orig,v:{minggu:m,iso:l.d,masa:l.s.mula.replace(/^0/,'')+'-'+l.s.tamat.replace(/^0/,''),ting:l.s.ting,kelas:l.s.kelas,bil:l.s.bil,tempat:l.s.tempat,sekolah:S.sekolah}}));
   const b=await gen.docxMany(items),n=clean(`RPH Harian M${m??''} ${d} ${HM[new Date(P(d)).getUTCDay()]}`)+'.docx';
